@@ -9,123 +9,165 @@ import numpy as np
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-BUCKETS = {
-    "EURO-AIFS": "ecmwf-forecasts",
-    "EAGLE-GraphCast": "noaa-nws-graphcastgfs-pds",
-    "FourCastNet": "noaa-nws-fourcastnetgfs-pds"
+# specific naming prefixes for the NOAA buckets
+BUCKET_CONFIG = {
+    "EURO-AIFS": {
+        "bucket": "ecmwf-forecasts",
+        "source": "ecmwf"
+    },
+    "EAGLE-GraphCast": {
+        "bucket": "noaa-nws-graphcastgfs-pds",
+        "source": "noaa",
+        "prefix_base": "graphcastgfs"
+    },
+    "FourCastNet": {
+        "bucket": "noaa-nws-fourcastnetgfs-pds",
+        "source": "noaa",
+        "prefix_base": "fcngfs"
+    }
 }
 
 s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
 
-def get_latest_prefix(bucket, model_type):
-    """Finds the latest available date folder."""
+def find_latest_data(model_name, config):
+    """
+    Scans the last 5 days to find the correct S3 prefix and file key.
+    Handles differences between NOAA (fcngfs/graphcast) and ECMWF structures.
+    """
+    bucket = config['bucket']
+    source = config['source']
+    
     date = datetime.utcnow()
-    # Check up to 5 days back (sometimes data is delayed)
-    for i in range(5): 
+    
+    # Try last 5 days
+    for i in range(5):
         date_str = date.strftime('%Y%m%d')
         
-        if "noaa" in bucket:
-            # NOAA Naming: graphcastgfs.20240205/00/
-            prefix = f"{model_type.lower().replace('-', '').replace('eagle', '')}.{date_str}/00/"
-            # Correction for EAGLE/GraphCast naming differences if needed
-            if "eagle" in model_type.lower():
-                prefix = f"graphcastgfs.{date_str}/00/"
-            if "fourcastnet" in model_type:
-                prefix = f"fcngfs.{date_str}/00/"
-        else:
-            # ECMWF Naming: 20240205/00z/aifs/0p25/oper/
-            prefix = f"{date_str}/00z/aifs/0p25/oper/"
-            
-        print(f"Checking {bucket}/{prefix}...")
-        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
-        if 'Contents' in resp:
-            print(f"FOUND data at {prefix}")
-            return prefix, date_str
+        # --- Construct Prefix Candidates ---
+        prefixes_to_check = []
         
+        if source == "noaa":
+            base = config['prefix_base']
+            # NOAA Format: [model].[date]/[hour]/forecasts/
+            # We check 00z, then 12z, then 06z, 18z
+            for hour in ["00", "12", "06", "18"]:
+                prefixes_to_check.append(f"{base}.{date_str}/{hour}/forecasts/")
+                prefixes_to_check.append(f"{base}.{date_str}/{hour}/") # Fallback without 'forecasts'
+        else:
+            # ECMWF Format: [date]/00z/aifs/0p25/oper/
+            prefixes_to_check.append(f"{date_str}/00z/aifs/0p25/oper/")
+            prefixes_to_check.append(f"{date_str}/12z/aifs/0p25/oper/")
+
+        # --- Check S3 for each candidate ---
+        for prefix in prefixes_to_check:
+            print(f"[{model_name}] Checking: s3://{bucket}/{prefix}")
+            
+            resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+            
+            if 'Contents' in resp:
+                # We found data! Now find the specific target file.
+                for obj in resp['Contents']:
+                    key = obj['Key']
+                    
+                    # File Filtering Logic
+                    if source == "noaa":
+                        # Look for forecast hour 12 (f012) or 6 (f006) to show movement
+                        # NOAA files usually look like: ...f012.grib2
+                        if key.endswith(".grib2") and ("f012" in key or "f006" in key):
+                            print(f"[{model_name}] ✅ Found file: {key}")
+                            return key, date_str
+                            
+                    elif source == "ecmwf":
+                        # ECMWF files are often just "date-run-step.grib2"
+                        # We take the first valid grib2
+                        if key.endswith(".grib2"):
+                            print(f"[{model_name}] ✅ Found file: {key}")
+                            return key, date_str
+                            
+        # Move to previous day if nothing found today
         date -= timedelta(days=1)
+        
     return None, None
 
-def download_and_plot(model_name, bucket):
-    print(f"--- Processing {model_name} ---")
-    prefix, date_str = get_latest_prefix(bucket, model_name)
+def process_model(model_name):
+    config = BUCKET_CONFIG[model_name]
+    bucket = config['bucket']
     
-    if not prefix:
-        print(f"❌ No data found for {model_name} in last 5 days.")
+    print(f"\n--- Starting {model_name} ---")
+    
+    # 1. Find Data
+    key, date_str = find_latest_data(model_name, config)
+    if not key:
+        print(f"❌ Failed to find data for {model_name} after checking last 5 days.")
         return False
 
-    # List files to find the forecast step
-    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    target_key = None
-    candidates = []
-
-    for obj in resp.get('Contents', []):
-        key = obj['Key']
-        candidates.append(key)
-        # We look for forecast hour 6 or 12 (f006/f012)
-        if "noaa" in bucket and ("f006" in key or "f012" in key):
-            target_key = key
-            break
-        elif "ecmwf" in bucket and key.endswith("grib2"):
-            target_key = key
-            break
-    
-    if not target_key:
-        print(f"❌ Found prefix but no matching GRIB file. First 5 files found:")
-        for c in candidates[:5]: print(f" - {c}")
-        return False
-
-    # Download
-    local_file = f"{model_name}.grib2"
-    print(f"Downloading {target_key}...")
-    s3.download_file(bucket, target_key, local_file)
-
-    # --- Processing ---
+    # 2. Download
+    local_filename = f"{model_name}.grib2"
     try:
-        # Open with explicit backend
-        ds = xr.open_dataset(local_file, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'surface'}})
+        print(f"Downloading {key}...")
+        s3.download_file(bucket, key, local_filename)
+    except Exception as e:
+        print(f"❌ Download failed: {e}")
+        return False
+
+    # 3. Process Image
+    try:
+        # Load GRIB2
+        # 'filter_by_keys' is critical for large GRIB files to pick just the surface level
+        ds = xr.open_dataset(local_filename, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'surface'}})
         
-        # Variable Mapping
-        temp_var = next((v for v in ds.data_vars if v in ['t2m', 'tmp', '2t']), None)
-        u_var = next((v for v in ds.data_vars if v in ['u10', 'ugrd', '10u']), None)
-        v_var = next((v for v in ds.data_vars if v in ['v10', 'vgrd', '10v']), None)
-
-        if not temp_var:
-            print(f"⚠️ Could not find Temperature variable. Available: {list(ds.data_vars)}")
-
-        # Plot Temp
-        if temp_var:
+        # Normalize Variable Names
+        # Different models call Temperature different things (t2m, tmp, 2t, etc.)
+        data_vars = list(ds.data_vars)
+        
+        t_var = next((v for v in data_vars if v in ['t2m', 'tmp', '2t']), None)
+        u_var = next((v for v in data_vars if v in ['u10', 'ugrd', '10u']), None)
+        v_var = next((v for v in data_vars if v in ['v10', 'vgrd', '10v']), None)
+        
+        # Generate Temp Map
+        if t_var:
             plt.figure(figsize=(10, 5))
-            data = ds[temp_var] - 273.15
-            data.plot(cmap='jet', vmin=-30, vmax=40, add_labels=False)
+            # Convert Kelvin to Celsius
+            temps = ds[t_var] - 273.15 
+            temps.plot(cmap='jet', vmin=-30, vmax=40, add_labels=False)
             plt.axis('off')
+            plt.title(f"{model_name} Temp ({date_str})")
             plt.savefig(f"assets/{model_name}_temp.png", bbox_inches='tight', pad_inches=0)
             plt.close()
-            print(f"✅ Generated {model_name}_temp.png")
+            print(f"✅ Saved {model_name}_temp.png")
+        else:
+            print(f"⚠️ {model_name}: No temperature variable found in {data_vars}")
 
-        # Plot Wind
+        # Generate Wind Map
         if u_var and v_var:
             plt.figure(figsize=(10, 5))
             wind = np.sqrt(ds[u_var]**2 + ds[v_var]**2)
             wind.plot(cmap='viridis', vmin=0, vmax=30, add_labels=False)
             plt.axis('off')
+            plt.title(f"{model_name} Wind ({date_str})")
             plt.savefig(f"assets/{model_name}_wind.png", bbox_inches='tight', pad_inches=0)
             plt.close()
-            print(f"✅ Generated {model_name}_wind.png")
-            
+            print(f"✅ Saved {model_name}_wind.png")
+        else:
+             print(f"⚠️ {model_name}: No wind variables found in {data_vars}")
+
         return True
 
     except Exception as e:
-        print(f"❌ Error processing {model_name}: {e}")
+        print(f"❌ Error processing GRIB data for {model_name}: {e}")
         return False
 
-# Main Execution
-os.makedirs("assets", exist_ok=True)
-success_count = 0
-for name, bucket in BUCKETS.items():
-    if download_and_plot(name, bucket):
-        success_count += 1
-
-# Fail the Action if NO images were generated
-if success_count == 0:
-    print("❌ No images were generated for any model. Exiting with error.")
-    sys.exit(1)
+# --- Main Execution ---
+if __name__ == "__main__":
+    os.makedirs("assets", exist_ok=True)
+    
+    success_count = 0
+    for model in BUCKET_CONFIG.keys():
+        if process_model(model):
+            success_count += 1
+            
+    if success_count == 0:
+        print("\n❌ CRITICAL: No images generated for any model.")
+        sys.exit(1)
+    else:
+        print(f"\n✅ Success! Generated data for {success_count} models.")
