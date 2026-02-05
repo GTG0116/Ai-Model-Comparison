@@ -1,4 +1,5 @@
 import os
+import sys
 import boto3
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -14,107 +15,117 @@ BUCKETS = {
     "FourCastNet": "noaa-nws-fourcastnetgfs-pds"
 }
 
-# Setup anonymous S3 client
 s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
 
 def get_latest_prefix(bucket, model_type):
-    """Finds the latest available date folder in the S3 buckets."""
-    # Logic varies slightly by bucket, simplifying for the most recent date
+    """Finds the latest available date folder."""
     date = datetime.utcnow()
-    for _ in range(3): # Check last 3 days
+    # Check up to 5 days back (sometimes data is delayed)
+    for i in range(5): 
         date_str = date.strftime('%Y%m%d')
         
-        # NOAA Naming Structure
         if "noaa" in bucket:
-            # Check 00z run
-            prefix = f"graphcastgfs.{date_str}/00/" if "graphcast" in bucket else f"fcngfs.{date_str}/00/"
-        
-        # ECMWF Naming Structure
+            # NOAA Naming: graphcastgfs.20240205/00/
+            prefix = f"{model_type.lower().replace('-', '').replace('eagle', '')}.{date_str}/00/"
+            # Correction for EAGLE/GraphCast naming differences if needed
+            if "eagle" in model_type.lower():
+                prefix = f"graphcastgfs.{date_str}/00/"
+            if "fourcastnet" in model_type:
+                prefix = f"fcngfs.{date_str}/00/"
         else:
-            # e.g., 20240205/00z/aifs/0p25/oper/
+            # ECMWF Naming: 20240205/00z/aifs/0p25/oper/
             prefix = f"{date_str}/00z/aifs/0p25/oper/"
             
-        # Check if exists
+        print(f"Checking {bucket}/{prefix}...")
         resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
         if 'Contents' in resp:
+            print(f"FOUND data at {prefix}")
             return prefix, date_str
+        
         date -= timedelta(days=1)
     return None, None
 
 def download_and_plot(model_name, bucket):
-    print(f"Processing {model_name}...")
+    print(f"--- Processing {model_name} ---")
     prefix, date_str = get_latest_prefix(bucket, model_name)
     
     if not prefix:
-        print(f"No data found for {model_name}")
-        return
+        print(f"❌ No data found for {model_name} in last 5 days.")
+        return False
 
-    # Find the file (Forecast hour 0 or 6 usually)
-    # We look for a file ending in grib2
+    # List files to find the forecast step
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
     target_key = None
-    
+    candidates = []
+
     for obj in resp.get('Contents', []):
         key = obj['Key']
-        # We want a forecast file, usually f006 or f012 to show change
-        if "noaa" in bucket and ("f012" in key or "f006" in key):
+        candidates.append(key)
+        # We look for forecast hour 6 or 12 (f006/f012)
+        if "noaa" in bucket and ("f006" in key or "f012" in key):
             target_key = key
             break
         elif "ecmwf" in bucket and key.endswith("grib2"):
-            # ECMWF often splits by variable or step. 
-            # For simplicity in this demo, we grab the first main forecast file
             target_key = key
             break
     
     if not target_key:
-        return
+        print(f"❌ Found prefix but no matching GRIB file. First 5 files found:")
+        for c in candidates[:5]: print(f" - {c}")
+        return False
 
     # Download
     local_file = f"{model_name}.grib2"
     print(f"Downloading {target_key}...")
     s3.download_file(bucket, target_key, local_file)
 
-    # --- Processing with Xarray ---
-    # Note: Requires cfgrib and eccodes installed in the runner
+    # --- Processing ---
     try:
+        # Open with explicit backend
         ds = xr.open_dataset(local_file, engine='cfgrib', backend_kwargs={'filter_by_keys': {'typeOfLevel': 'surface'}})
         
-        # Identify variables (names vary by model)
-        # Standardize names: t2m (temp), u10/v10 (wind)
-        # This is a simplified mapping logic
-        temp_var = None
-        u_var = None
-        v_var = None
+        # Variable Mapping
+        temp_var = next((v for v in ds.data_vars if v in ['t2m', 'tmp', '2t']), None)
+        u_var = next((v for v in ds.data_vars if v in ['u10', 'ugrd', '10u']), None)
+        v_var = next((v for v in ds.data_vars if v in ['v10', 'vgrd', '10v']), None)
 
-        for v in ds.data_vars:
-            if v in ['t2m', 'tmp', '2t']: temp_var = v
-            if v in ['u10', 'ugrd', '10u']: u_var = v
-            if v in ['v10', 'vgrd', '10v']: v_var = v
+        if not temp_var:
+            print(f"⚠️ Could not find Temperature variable. Available: {list(ds.data_vars)}")
 
-        # Generate Temp Map
+        # Plot Temp
         if temp_var:
             plt.figure(figsize=(10, 5))
-            data = ds[temp_var] - 273.15 # Kelvin to C
-            data.plot(cmap='jet', vmin=-30, vmax=40)
-            plt.title(f"{model_name} - Temperature (°C) - {date_str}")
+            data = ds[temp_var] - 273.15
+            data.plot(cmap='jet', vmin=-30, vmax=40, add_labels=False)
             plt.axis('off')
             plt.savefig(f"assets/{model_name}_temp.png", bbox_inches='tight', pad_inches=0)
             plt.close()
+            print(f"✅ Generated {model_name}_temp.png")
 
-        # Generate Wind Map
+        # Plot Wind
         if u_var and v_var:
             plt.figure(figsize=(10, 5))
-            wind_speed = np.sqrt(ds[u_var]**2 + ds[v_var]**2)
-            wind_speed.plot(cmap='viridis', vmin=0, vmax=30)
-            plt.title(f"{model_name} - Wind Speed (m/s) - {date_str}")
+            wind = np.sqrt(ds[u_var]**2 + ds[v_var]**2)
+            wind.plot(cmap='viridis', vmin=0, vmax=30, add_labels=False)
             plt.axis('off')
             plt.savefig(f"assets/{model_name}_wind.png", bbox_inches='tight', pad_inches=0)
             plt.close()
+            print(f"✅ Generated {model_name}_wind.png")
+            
+        return True
 
     except Exception as e:
-        print(f"Error processing {model_name}: {e}")
+        print(f"❌ Error processing {model_name}: {e}")
+        return False
 
-# Run for all
+# Main Execution
 os.makedirs("assets", exist_ok=True)
+success_count = 0
 for name, bucket in BUCKETS.items():
-    download_and_plot(name, bucket)
+    if download_and_plot(name, bucket):
+        success_count += 1
+
+# Fail the Action if NO images were generated
+if success_count == 0:
+    print("❌ No images were generated for any model. Exiting with error.")
+    sys.exit(1)
