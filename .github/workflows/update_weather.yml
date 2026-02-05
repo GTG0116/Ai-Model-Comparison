@@ -1,0 +1,42 @@
+name: Update Weather Models
+
+on:
+  schedule:
+    - cron: '0 8 * * *' # Runs daily at 8 AM UTC
+  workflow_dispatch:      # Allows manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v3
+
+    - name: Install System Dependencies (eccodes)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libeccodes-dev
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Python libraries
+      run: |
+        pip install -r scripts/requirements.txt
+
+    - name: Fetch and Process Data
+      run: python scripts/fetch_and_plot.py
+
+    - name: Commit and Push changes
+      run: |
+        git config --global user.name 'WeatherBot'
+        git config --global user.email 'bot@noreply.github.com'
+        git add assets/*.png
+        git commit -m "Update weather model images" || echo "No changes to commit"
+        git push
