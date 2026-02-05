@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Weather Model Comparator</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #111; color: white; margin: 0; display: flex; flex-direction: column; align-items: center; }
+        header { padding: 20px; text-align: center; }
+        .controls { display: flex; gap: 15px; margin-bottom: 20px; background: #222; padding: 10px; border-radius: 8px; }
+        button { background: #333; color: white; border: 1px solid #444; padding: 8px 16px; cursor: pointer; border-radius: 4px; transition: 0.2s; }
+        button.active { background: #007bff; border-color: #007bff; }
+        button:hover { background: #444; }
+        
+        .viewer-container { width: 90%; max-width: 1200px; position: relative; aspect-ratio: 2/1; background: #000; border: 1px solid #333; overflow: hidden; border-radius: 8px; }
+        .map-image { width: 100%; height: 100%; object-fit: contain; display: none; }
+        .map-image.active { display: block; }
+        
+        .status { margin-top: 10px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>AI Weather Model Comparator</h1>
+    <p>Comparing EURO-AIFS, EAGLE (GraphCast), and FourCastNet</p>
+</header>
+
+<div class="controls">
+    <div>
+        <label>Model:</label>
+        <button onclick="setModel('EURO-AIFS')" class="btn-model active" id="m-euro">EURO-AIFS</button>
+        <button onclick="setModel('EAGLE-GraphCast')" class="btn-model" id="m-eagle">EAGLE</button>
+        <button onclick="setModel('FourCastNet')" class="btn-model" id="m-four">FourCastNet</button>
+    </div>
+    <div style="border-left: 1px solid #444; padding-left: 15px;">
+        <label>Layer:</label>
+        <button onclick="setLayer('temp')" class="btn-layer active" id="l-temp">Temperature</button>
+        <button onclick="setLayer('wind')" class="btn-layer" id="l-wind">Wind Speed</button>
+    </div>
+</div>
+
+<div class="viewer-container">
+    <img id="display-img" src="assets/EURO-AIFS_temp.png" class="map-image active" alt="Weather Map">
+</div>
+
+<div class="status">
+    Data sourced from NOAA & ECMWF Open Data on AWS. Updated daily via GitHub Actions.
+</div>
+
+<script>
+    let currentModel = 'EURO-AIFS';
+    let currentLayer = 'temp';
+
+    function updateView() {
+        const img = document.getElementById('display-img');
+        // Construct path: assets/ModelName_layer.png
+        img.src = `assets/${currentModel}_${currentLayer}.png`;
+        img.onerror = function() { this.src = 'https://via.placeholder.com/800x400?text=Data+Processing+or+Unavailable'; };
+        
+        // Update Buttons
+        document.querySelectorAll('.btn-model').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.btn-layer').forEach(b => b.classList.remove('active'));
+        
+        // Fix ID mapping for buttons
+        let mId = 'm-euro';
+        if(currentModel === 'EAGLE-GraphCast') mId = 'm-eagle';
+        if(currentModel === 'FourCastNet') mId = 'm-four';
+        document.getElementById(mId).classList.add('active');
+
+        document.getElementById(currentLayer === 'temp' ? 'l-temp' : 'l-wind').classList.add('active');
+    }
+
+    function setModel(m) { currentModel = m; updateView(); }
+    function setLayer(l) { currentLayer = l; updateView(); }
+</script>
+
+</body>
+</html>
